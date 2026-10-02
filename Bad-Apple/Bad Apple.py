@@ -10,7 +10,9 @@ import re
 import sys
 import time
 import atexit
+import shutil
 import signal
+import unicodedata
 from pathlib import Path
 
 import pygame
@@ -141,21 +143,266 @@ def detect_light_bg():
 
 
 def wait_any_key(prompt="按任意键继续..."):
+    """停一下等按键（进入 curses 前的最后一句话，比如"按任意键开始播放…"）。
+
+    非 TTY（管道、重定向、CI、测试）下拿不到 termios（`tcgetattr` 会直接抛
+    `termios.error`），退化成读一行——不能让它把整条流程炸掉。
+    """
     print(prompt, end="", flush=True)
-    if os.name == "nt":
-        import msvcrt
-        msvcrt.getch()
-    else:
-        import termios
-        import tty
-        fd = sys.stdin.fileno()
-        old_attr = termios.tcgetattr(fd)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.getch()
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_attr = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+    except Exception:
         try:
-            tty.setraw(fd)
-            sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+            input()
+        except (EOFError, OSError, ValueError):
+            pass
     print()
+
+
+# ============ 交互界面 ============
+#
+# 所有选择都走同一个 _menu()：TTY 下是方向键菜单，非 TTY（管道、
+# 重定向、测试）自动回退成编号输入，因此脚本里也能用。
+
+def _is_tty():
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _dwidth(text):
+    """终端显示宽度：中日韩全角字符占 2 列，len() 会算少。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in text)
+
+
+def _dpad(text, width):
+    return text + " " * max(0, width - _dwidth(text))
+
+
+def _init_colors(stdscr):
+    """把窗口背景钉成终端的默认前景/背景色，返回绘制用的基础属性。
+
+    不少终端（尤其 IDE 内置的模拟终端）是 bce（背景色擦除）的：curses 画
+    连续空格时会改用 ECH/EL，"填充色"取的是当前背景色。如果不显式把背景
+    设成终端默认色，整片空格就可能被填成别的颜色 —— 表现就是播放时出现
+    横贯画面的白条，而且只出现在"空格段"上，同行的字符却正常。
+
+    这里的 except Exception 是有意的：要跨 ncurses / windows-curses 和
+    不支持默认色的终端探测能力，拿不到就退回无色。
+    """
+    attr = curses.A_NORMAL
+    try:
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, -1, -1)     # -1 = 终端默认色
+            attr = curses.color_pair(1)
+    except Exception:
+        attr = curses.A_NORMAL
+
+    for call in (lambda: stdscr.bkgd(" ", attr),      # 擦除/空格用这个背景
+                 lambda: stdscr.attrset(attr)):
+        try:
+            call()
+        except Exception:
+            pass
+    return attr
+
+
+def _safe_addstr(win, y, x, text, attr=0):
+    """写右下角会抛 curses.error，统一吞掉。"""
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def _fmt_size(path):
+    try:
+        return f"{path.stat().st_size / 1024 / 1024:.1f} MB"
+    except OSError:
+        return ""
+
+
+def _charset_label(info, preview=""):
+    """缓存里字符集的显示名：braille / custom 带参数预览。"""
+    name = info.get("charset", "classic")
+    if name in ("custom", convert.BRAILLE_CHARSET) and preview:
+        return f"{name} [{preview}]"
+    return name
+
+
+def _menu_curses(stdscr, title, options, default, cancel, footer,
+                 esc_value=None):
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass
+    stdscr.keypad(True)
+    base = _init_colors(stdscr)        # 空白格用终端默认背景
+    idx = max(0, min(default, len(options) - 1))
+    top = 0
+    # 底部提示直接把 Esc 的落点写出来：有些屏的 cancel 不是"取消"而是
+    # "重新设置"、"不使用音频"，笼统写 Esc 取消会骗人。
+    hint = footer or ("↑↓ 选择   Enter 确认"
+                      + (f"   Esc = {cancel}" if cancel else ""))
+    # 说明列统一对齐到最长标签之后（按显示宽度，CJK 算 2 列）
+    label_w = max(_dwidth(label) for label, _ in options)
+    detail_col = 3 + label_w + 3
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        row = 0
+        if title:
+            _safe_addstr(stdscr, row, 0, title[:w - 1], base | curses.A_BOLD)
+            row += 2
+        avail = max(1, h - row - 2)
+
+        if idx < top:
+            top = idx
+        elif idx >= top + avail:
+            top = idx - avail + 1
+
+        for n in range(top, min(len(options), top + avail)):
+            label, detail = options[n]
+            attr = base | (curses.A_REVERSE if n == idx else curses.A_NORMAL)
+            prefix = " ▸ " if n == idx else "   "
+            _safe_addstr(stdscr, row, 0, (prefix + label)[:w - 1], attr)
+            if detail and detail_col < w - 1:
+                _safe_addstr(stdscr, row, detail_col,
+                             detail[:w - detail_col - 1], attr | curses.A_DIM)
+            row += 1
+
+        if len(options) > avail:      # 滚动指示
+            _safe_addstr(stdscr, h - 2, 0,
+                         f"   {idx + 1}/{len(options)}"[:w - 1],
+                         base | curses.A_DIM)
+        _safe_addstr(stdscr, h - 1, 0, hint[:w - 1], base | curses.A_DIM)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(options)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(options)
+        elif ch == curses.KEY_HOME:
+            idx = 0
+        elif ch == curses.KEY_END:
+            idx = len(options) - 1
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return idx
+        elif ch == 27:                       # Esc
+            if cancel:
+                return None
+            if esc_value is not None:
+                return esc_value
+        elif ch in (ord("q"), ord("Q")):
+            if cancel:
+                return None
+            if esc_value is not None:
+                return esc_value
+        elif curses.KEY_RESIZE == ch:
+            continue
+        elif ord("1") <= ch <= ord("9"):
+            n = ch - ord("1")
+            if n < len(options):
+                return n
+
+
+def _menu_plain(title, options, default, cancel, footer, esc_value=None):
+    """非 TTY 回退：打印编号列表，读一行输入。
+
+    esc_value 只对 Esc 有意义，编号菜单没有 Esc，忽略即可。
+    """
+    if title:
+        print(f"\n{title}")
+    for i, (label, detail) in enumerate(options, 1):
+        suffix = f"   {detail}" if detail else ""
+        print(f"  [{i}] {label}{suffix}")
+    if cancel:
+        print(f"  [0] {cancel}")
+
+    lo = 0 if cancel else 1
+    while True:
+        s = input(f"序号 ({lo}-{len(options)}，回车默认 {default + 1}): ").strip()
+        if not s:
+            return default
+        if s == "0" and cancel:
+            return None
+        if s.isdigit() and 1 <= int(s) <= len(options):
+            return int(s) - 1
+        print("输入无效，请重试。")
+
+
+def _menu(title, options, default=0, cancel=None, footer=None, esc_value=None):
+    """方向键单选菜单。
+
+    options 是 [(标签, 说明), ...]；返回选中下标。
+    cancel     非空时 Esc/q 返回 None，编号菜单里会多出一项 [0]。
+    esc_value  Esc/q 直接返回这个下标，**不会**多出菜单项 —— 用于
+               "Esc 等于确认某个动作"但又不想多一行的情况。
+    只有一项且不可取消时不弹菜单，直接返回。
+    """
+    if not options:
+        return None
+    if len(options) == 1 and cancel is None:
+        return 0
+    if not _is_tty():
+        return _menu_plain(title, options, default, cancel, footer, esc_value)
+
+    # 菜单期间也置脏，这样 Ctrl+C 走信号处理器时能恢复终端；
+    # 否则进程被直接杀掉，终端会卡在 curses 状态（无回显、备用屏）。
+    global _terminal_dirty
+    _terminal_dirty = True
+    try:
+        return curses.wrapper(_menu_curses, title, options, default,
+                              cancel, footer, esc_value)
+    except (curses.error, OSError):
+        # 终端不支持 curses（TERM=dumb / 未设置）时退回编号菜单。
+        # 故意只捕这两类：_menu_curses 自身的 bug 应该直接暴露出来。
+        _restore_terminal()
+        return _menu_plain(title, options, default, cancel, footer, esc_value)
+    finally:
+        _terminal_dirty = False
+        _stty_sane()
+
+
+def ask_text(prompt, default="", hint=""):
+    """读一行文本；直接回车返回 default（调用方约定空串=保持不变）。
+
+    只在 default 非空时才补 [回车=xxx]：否则会和 hint 里的
+    "回车=视频自带" 之类打架，出现 "（回车=视频自带） [回车=空]" 这种怪提示。
+    """
+    suffix = f"（{hint}）" if hint else ""
+    tail = f" [回车={default}]" if default != "" else ""
+    s = input(f"{prompt}{suffix}{tail}: ").strip()
+    return s if s else default
+
+
+def ask_number(prompt, default, hint="", cast=int):
+    s = ask_text(prompt, "", hint)
+    if s == "":
+        return default
+    try:
+        return cast(s)
+    except (TypeError, ValueError):
+        print(f"输入无效，保持 {default}")
+        return default
 
 
 # ============ 缓存管理 ============
@@ -197,9 +444,11 @@ class Cache:
     def _charset_tag(charset_name, chars=None):
         if charset_name == "classic":
             return ""
-        if charset_name == "custom":
+        if charset_name in ("custom", convert.BRAILLE_CHARSET):
+            # custom 的字符表、braille 的抖动参数（spec 串）都要进哈希，
+            # 否则不同参数会撞进同一个缓存文件。
             h = hashlib.md5("".join(chars or []).encode("utf-8")).hexdigest()[:6]
-            return f"_custom{h}"
+            return f"_{charset_name}{h}"
         return f"_{charset_name}"
 
     @classmethod
@@ -218,6 +467,9 @@ class Cache:
         if tag.startswith("custom"):
             charset_name = "custom"
             charset_tag = tag                    # 保留完整 tag，如 custom_a1b2c3
+        elif tag.startswith(convert.BRAILLE_CHARSET):
+            charset_name = convert.BRAILLE_CHARSET
+            charset_tag = tag                    # 如 braille_a1b2c3
         elif tag == "":
             charset_name = "classic"
             charset_tag = ""
@@ -284,9 +536,30 @@ class Cache:
         fps = fps_override or payload.get("video_fps", 30.0)
         return payload["video_data"], fps, payload.get("settings", {})
 
+    @staticmethod
+    def _payload_mismatch(settings, chars, frame_step, interp):
+        """缓存 payload 与当前设置的差异说明；完全一致返回 None。
+
+        缓存文件名只编码 宽高 / 明暗 / 字符集，抽帧步长和插值方式**不在 key 里**
+        （加进去会让现有 1.2 GB 缓存全部作废），所以命中之后必须回读 payload
+        核对：不一致就当没命中，让调用方重新转换 —— 否则用户在设置屏把抽帧从
+        1 改成 2、或把插值从 nearest 改成 area，会被一个同名的旧缓存静默顶掉，
+        看起来像"设置没生效"。
+        """
+        if settings.get("chars") != "".join(chars or []):
+            return "字符表不同"
+        if frame_step is not None \
+                and int(settings.get("frame_step", 1)) != int(frame_step):
+            return (f"抽帧步长是 {settings.get('frame_step', 1)}，"
+                    f"当前是 {frame_step}")
+        if interp is not None and settings.get("interp", None) not in (None, interp):
+            return f"插值方式是 {settings.get('interp')}，当前是 {interp}"
+        return None
+
     def load_data(self, video_path, width, height, invert,
-                  charset_name="classic", chars=None, fps_override=None):
-        """按设置精确查找缓存（用于向导结束后再查一次）。"""
+                  charset_name="classic", chars=None, fps_override=None,
+                  frame_step=None, interp=None):
+        """按设置精确查找缓存（用于向导结束后再查一次）→ (data, fps) 或 None。"""
         path = self.data_path(video_path, width, height, invert,
                               charset_name, chars)
         if not path.exists():
@@ -295,10 +568,80 @@ class Cache:
         if result is None:
             return None
         data, fps, settings = result
-        expected_chars = "".join(chars or [])
-        if settings.get("chars") != expected_chars:
+        why = self._payload_mismatch(settings, chars, frame_step, interp)
+        if why:
+            print(f"已有缓存{why}，重新转换。")
             return None
         return data, fps
+
+    def load_opposite(self, video_path, width, height, invert,
+                      charset_name="classic", chars=None, fps_override=None,
+                      frame_step=None, interp=None):
+        """没命中时，试试**反明暗**的同名缓存，取反后直接用。
+
+        深浅两种终端下渲染的唯一差别就是"最后整体取反"（见
+        `convert.invert_frames`），所以把对面那份缓存逐字符翻过来，和重新解码
+        渲染一遍得到的结果**完全相同**，但只需读一遍 pickle：
+
+            180x60 深色缓存 --取反--> 180x60 浅色帧（不用碰视频）
+
+        条件与 `load_data` 一致（字符表 / 抽帧 / 插值必须对得上）；不满足、
+        ASCII 自定义字符表有重复字符、或对面压根没缓存时返回 None，由调用方
+        走正常的转换流程。返回 (data, fps)。
+        """
+        path = self.data_path(video_path, width, height, not invert,
+                              charset_name, chars)
+        if not path.exists():
+            return None
+        result = self.load_by_path(path, fps_override)
+        if result is None:
+            return None
+        data, fps, settings = result
+        why = self._payload_mismatch(settings, chars, frame_step, interp)
+        if why:
+            print(f"反明暗的缓存{why}（缓存 key 里不含抽帧/插值），改为从视频转换。")
+            return None
+        flipped = convert.invert_frames(data, charset_name, chars)
+        if flipped is None:
+            print("自定义字符表里有重复字符，无法可靠取反，改为从视频转换。")
+            return None
+        print(f"复用反明暗缓存取反：{term_label(not invert)} → "
+              f"{term_label(invert)}（{len(flipped)} 帧，不重新解码视频）")
+        return flipped, fps
+
+    def generate_inverted(self, src_path, video_path):
+        """把某个缓存取反，另存成相反明暗的同名缓存。成功返回 True。
+
+        给缓存菜单里的「⇄ 取反生成另一版」用：不需要知道抽帧/插值等设置，
+        源缓存里怎么配的就照抄，只把明暗那一位翻过来。
+        """
+        info = self._parse_key(Path(src_path).stem)
+        if info is None:
+            return False
+        try:
+            with open(src_path, "rb") as f:
+                payload = pickle.load(f)
+        except Exception as e:
+            print(f"缓存读取失败: {e}")
+            return False
+
+        settings = payload.get("settings", {})
+        charset_name = settings.get("charset", info["charset"])
+        chars = settings.get("chars", "")
+        flipped = convert.invert_frames(payload["video_data"], charset_name, chars)
+        if flipped is None:
+            print(f"{Path(src_path).name}: 自定义字符表里有重复字符，跳过")
+            return False
+
+        target_invert = not info["invert"]
+        dst = self.data_path(video_path, info["width"], info["height"],
+                             target_invert, charset_name, chars)
+        if not dst.exists():
+            convert.save_frames(dst, flipped, dict(settings, invert=target_invert),
+                                payload.get("video_fps", 30.0))
+        print(f"{Path(src_path).name} → {dst.name}"
+              f"（{len(flipped)} 帧，不重新解码视频）")
+        return True
 
 
 # ============ data/ 扫描 ============
@@ -333,57 +676,37 @@ def scan_data_groups():
     return groups
 
 
-def _choose(items, kind):
+def _choose(items, kind, cancel=None):
+    """从同类文件里选一个；只有一个时直接返回。
+
+    cancel 非空时 Esc/q 返回 None，让调用方退回上一层菜单；只有一个候选时
+    不弹菜单，也就没有"返回"可言（直接返回那一个）。
+    """
     if not items:
         return None
     if len(items) == 1:
-        print(f"自动选择{kind}: {items[0].name}")
         return items[0]
+    opts = [(p.name, _fmt_size(p)) for p in items]
+    i = _menu(f"选择{kind}", opts, cancel=cancel)
+    return None if i is None else items[i]
 
-    print(f"\n发现多个{kind}，请选择:")
-    for i, p in enumerate(items, 1):
-        try:
-            size_mb = p.stat().st_size / 1024 / 1024
-            size_str = f"  ({size_mb:.1f} MB)"
-        except OSError:
-            size_str = ""
-        print(f"  [{i}] {p.name}{size_str}")
-
-    while True:
-        s = input(f"序号 (1-{len(items)}, 回车默认 1): ").strip()
-        if not s:
-            return items[0]
-        if s.isdigit() and 1 <= int(s) <= len(items):
-            return items[int(s) - 1]
-        print("输入无效，请重试。")
 
 def _choose_group(groups):
-    """从作品列表里选一个，返回 (folder, videos, audios)。"""
+    """从作品列表里选一个，返回 (folder, videos, audios)。
+
+    这是第一屏，没有上一层可退，所以不传 cancel：Esc/q 在这屏没有动作
+    （想中止就直接 Ctrl+C，信号处理器会恢复终端）。
+    """
     if len(groups) == 1:
-        folder, vids, auds = groups[0]
-        print(f"自动选择作品: {folder.name}/")
         return groups[0]
 
-    print("\n发现多个作品，请选择:")
-    for i, (folder, vids, auds) in enumerate(groups, 1):
-        if folder == DATA_DIR:
-            label = "根目录"
-        else:
-            label = folder.name + "/"
-        v_str = vids[0].name if vids else "无视频"
-        a_str = auds[0].name if auds else "无音频"
-        extra = ""
-        if len(vids) > 1 or len(auds) > 1:
-            extra = f"  [视频 {len(vids)}, 音频 {len(auds)}]"
-        print(f"  [{i}] {label}  ({v_str} + {a_str}){extra}")
-
-    while True:
-        s = input(f"序号 (1-{len(groups)}, 回车默认 1): ").strip()
-        if not s:
-            return groups[0]
-        if s.isdigit() and 1 <= int(s) <= len(groups):
-            return groups[int(s) - 1]
-        print("输入无效，请重试。")
+    opts = []
+    for folder, vids, auds in groups:
+        label = "根目录" if folder == DATA_DIR else folder.name + "/"
+        detail = f"{len(vids)} 视频 · {len(auds)} 音频"
+        opts.append((label, detail))
+    i = _menu("选择作品", opts, default=0)
+    return groups[i if i is not None else 0]
 
 
 # ============ 播放 ============
@@ -429,12 +752,14 @@ def play(video_data, fps, bgm_path, delay=0.4):
     # 在进入 curses 之前先试加载音频，失败能看到提示
     audio_ok = _load_audio_safe(bgm_path)
     if not audio_ok:
+        had_audio = bgm_path is not None      # None = 本来就没配音频，不必停顿
         bgm_path = None
-        if delay > 0:
-            # 给用户时间看提示
+        # 一定要停一下等回车：下面 curses 一清屏，上面那段失败原因就没了。
+        # 早先只在 delay > 0 时才等，于是 -d 0 会把提示直接刷掉。
+        if had_audio:
             try:
                 input("按回车继续（静音播放）...")
-            except EOFError:
+            except (EOFError, OSError):
                 pass
 
     stdscr = curses.initscr()
@@ -446,13 +771,18 @@ def play(video_data, fps, bgm_path, delay=0.4):
         curses.curs_set(0)
     except curses.error:
         pass
+    normal = _init_colors(stdscr)      # 空白格必须用终端默认背景填充
     stdscr.clear()
     stdscr.refresh()
 
-    try:
+    def fit():
+        """按当前窗口尺寸算可画的行列数。"""
         max_y, max_x = stdscr.getmaxyx()
-        rows = min(len(video_data[0]) if video_data else 0, max_y - 1)
-        cols = max_x - 1
+        rows = min(len(video_data[0]) if video_data else 0, max(0, max_y - 1))
+        return rows, max(0, max_x - 1)
+
+    try:
+        rows, cols = fit()
 
         if bgm_path is not None:
             pygame.mixer.music.play()
@@ -461,15 +791,19 @@ def play(video_data, fps, bgm_path, delay=0.4):
         timer = FpsTimer(fps)
         for frame_data in video_data:
             stdscr.nodelay(True)
-            if stdscr.getch() in (ord("q"), 27):
+            ch = stdscr.getch()
+            if ch in (ord("q"), 27):
                 break
+            if ch == curses.KEY_RESIZE:
+                # 窗口变了就重算行列并整屏重画：erase() 会把旧内容清干净
+                rows, cols = fit()
 
             stdscr.erase()
             for i in range(rows):
                 line = (frame_data[i][:cols].ljust(cols)
                         if i < len(frame_data) else " " * cols)
                 try:
-                    stdscr.addstr(i, 0, line)
+                    stdscr.addstr(i, 0, line, normal)
                 except curses.error:
                     pass
 
@@ -497,9 +831,13 @@ def parse_args():
     simple.add_argument("-W", "--width", type=int, help="字符画宽度")
     simple.add_argument("-H", "--height", type=int, help="字符画高度")
     simple.add_argument("-c", "--charset", metavar="NAME",
-                        help=f"预设字符集，可选: {', '.join(convert.CHARSETS)}")
+                        help=f"预设字符集，可选: {', '.join(convert.CHARSETS)}, "
+                             f"{convert.BRAILLE_CHARSET}")
     simple.add_argument("--chars", metavar="STR",
                         help="自定义字符表（从密到疏），覆盖 --charset")
+    simple.add_argument("--braille", action="store_true",
+                        help="Braille 点阵模式（等价于 -c braille，"
+                             "黑白下的极限分辨率）")
     simple.add_argument("-L", "--list-charsets", action="store_true",
                         help="列出预设字符集并退出")
 
@@ -508,46 +846,51 @@ def parse_args():
                      help="播放帧率，不填则用视频自带")
     adv.add_argument("-d", "--delay", type=float, default=0.4,
                      help="音乐开始后延迟多少秒才出画面")
+    # 两个参数共用 dest="invert"，默认值 None = 自动检测终端背景。
+    # --no-invert 必须显式写 SUPPRESS，否则 store_false 会自带
+    # default=True，既污染帮助里的 "(default: True)"，也容易误导读者。
     adv.add_argument("-i", "--invert", dest="invert", action="store_true",
-                     default=None, help="强制反转（浅色终端）")
+                     default=None, help="强制反转（深色终端，亮像素用密字符）")
     adv.add_argument("--no-invert", dest="invert", action="store_false",
-                     help="强制不反转（深色终端）")
+                     default=argparse.SUPPRESS,
+                     help="强制不反转（浅色终端）")
     adv.add_argument("-r", "--rebuild", action="store_true",
                      help="忽略缓存，强制重新转换")
-    adv.add_argument("--frame-step", type=int, default=1, metavar="N",
-                     help="抽帧步长，N=2 表示隔一帧取一帧，转换时间减半")
+    # frame_step / interp 的默认值用 None：这样才能区分"用户显式指定"和
+    # "没写"，从而让设置屏回退到 config.json 里上次用的值（优先级见 README）。
+    adv.add_argument("--frame-step", type=int, default=None, metavar="N",
+                     help="抽帧步长，N=2 表示隔一帧取一帧，转换时间减半；"
+                          "不填则沿用该视频上次的设置（默认 1）")
     adv.add_argument("--interp", choices=list(convert.INTERP_MAP),
-                     default=convert.DEFAULT_INTERP,
-                     help="缩放插值方式")
+                     default=None,
+                     help="缩放插值方式；不填则沿用该视频上次的设置"
+                          f"（默认 {convert.DEFAULT_INTERP}）")
+    adv.add_argument("--braille-dither", choices=list(convert.DITHER_MODES),
+                     help="Braille 抖动方式，仅在 Braille 模式下生效")
+    adv.add_argument("--braille-gamma", type=float, metavar="G",
+                     help="Braille gamma 校正（1.0 中性，>1 提亮暗部）")
     adv.add_argument("--threads", type=int,
                      help="OpenCV 线程数，弱 CPU 上设 1 可减少调度开销")
     adv.add_argument("--setup", action="store_true",
-                     help="强制启动交互式设置向导")
+                     help="强制进入设置屏，跳过缓存菜单")
 
     return p.parse_args()
 
 
 # ============ 决策函数 ============
 
-def ask_int(prompt, default, hint=""):
-    suffix = f" {hint}" if hint else ""
-    s = input(f"{prompt} (默认 {default}{suffix}): ").strip()
-    if not s:
-        return default
-    try:
-        return int(s)
-    except ValueError:
-        print(f"输入无效，使用默认值 {default}")
-        return default
-
-
 def resolve_media(args):
-    """返回 (video_path, audio_path)。audio_path 可能为 None。"""
+    """返回 (video_path, audio_path)。audio_path 可能为 None。
+
+    两层循环对应"作品 → 视频"两级菜单，每层的菜单都能 Esc 退回上一层：
+    选视频时 Esc 回作品菜单；选音频时 Esc 回它真正的上一屏（视频菜单，若
+    视频只有一个则回作品菜单；一层菜单都没弹过就没得退，Esc 仍是"静音"）。
+    """
     if args.video:
         video = Path(args.video)
         if not video.exists():
             sys.exit(f"视频不存在: {video}")
-        audio = _resolve_audio_in(args, video.parent, video)
+        audio, _ = _resolve_audio_in(args, video.parent, video)
         return video, audio
 
     groups = scan_data_groups()
@@ -555,89 +898,284 @@ def resolve_media(args):
     if not valid:
         sys.exit(f"未在 {DATA_DIR} 找到视频文件，请把视频放入 data/作品名/")
 
-    folder, videos, audios = _choose_group(valid)
-    video = _choose(videos, "视频")
-    audio = _resolve_audio_in(args, folder, video, audios)
-    return video, audio
+    while True:                                   # 作品层
+        folder, videos, audios = _choose_group(valid)
+
+        while True:                               # 视频层
+            video = _choose(videos, "视频",
+                            cancel="← 返回选作品" if len(valid) > 1 else None)
+            if video is None:                     # Esc：回作品菜单
+                break
+
+            # 音频菜单的"上一屏"到底是谁，取决于前面哪几个菜单真的弹过
+            if len(videos) > 1:
+                back_hint = "选视频"
+            elif len(valid) > 1:
+                back_hint = "选作品"
+            else:
+                back_hint = None              # 一层菜单都没弹过，没得退
+
+            audio, back = _resolve_audio_in(args, folder, video, audios,
+                                            back=back_hint)
+            if not back:
+                return video, audio
+            if back_hint == "选视频":
+                continue                      # 回视频菜单
+            break                             # 回作品菜单
 
 
-def _resolve_audio_in(args, folder, video, audios=None):
-    """在指定文件夹里为视频找音频，找不到返回 None（静音播放）。
+def _resolve_audio_in(args, folder, video, audios=None, back=None):
+    """在指定文件夹里为视频找音频。返回 (audio_path, back)。
 
-    优先级：--bgm > 同名 > 唯一 > 询问 > 无。
+    优先级：--bgm > 同名 > 唯一 > 询问 > 无；audio_path 为 None 表示静音播放。
+    back=True 表示用户在菜单里选了"返回上一步"，由调用方决定退回哪一屏。
+
+    back 非空（有上一屏可退）时，"不使用音频"必须降级成普通菜单项，把 Esc
+    让给"返回"；否则 Esc 同时意味着"静音"和"返回"，只能二选一。
     """
     if args.bgm:
         p = Path(args.bgm)
         if not p.exists():
             sys.exit(f"音乐不存在: {p}")
-        return p
+        return p, False
 
     if audios is None:
         audios = sorted(f for f in folder.iterdir()
                         if f.is_file() and f.suffix.lower() in AUDIO_EXTS)
     if not audios:
-        print("未找到音频，将静音播放")
-        return None
+        return None, False
 
-    # 1) 同名优先
+    # 1) 同名优先；2) 只有一个就直接用
     for a in audios:
         if a.stem == video.stem:
-            print(f"自动配对同名音频: {a.name}")
-            return a
-
-    # 2) 只有一个音频直接选
+            return a, False
     if len(audios) == 1:
-        print(f"自动选择音频: {audios[0].name}")
-        return audios[0]
+        return audios[0], False
 
     # 3) 多个音频让用户选，也可以跳过
-    print("\n发现多个音频：")
-    for i, p in enumerate(audios, 1):
-        print(f"  [{i}] {p.name}")
-    print(f"  [0] 不使用音频（静音播放）")
-    while True:
-        s = input(f"序号 (0-{len(audios)}, 回车默认 1): ").strip()
-        if not s:
-            return audios[0]
-        if s == "0":
-            print("已选择静音播放")
-            return None
-        if s.isdigit() and 1 <= int(s) <= len(audios):
-            return audios[int(s) - 1]
-        print("输入无效，请重试。")
+    opts = [(a.name, _fmt_size(a)) for a in audios]
+    if back:
+        opts.append(("不使用音频（静音播放）", ""))
+        i = _menu("选择音频", opts, cancel=f"← 返回{back}（不改动）")
+        if i is None:
+            return None, True
+        return (None, False) if i == len(opts) - 1 else (audios[i], False)
+
+    # 第一屏：没有上一层可退，Esc 就是"不要音频"
+    i = _menu("选择音频", opts, cancel="不使用音频（静音播放）")
+    return (None, False) if i is None else (audios[i], False)
 
 
-def resolve_invert(args, video_path, cache):
-    if args.invert is not None:
-        return args.invert
-    is_light = detect_light_bg()
-    _stty_sane()
-    if is_light is None:
-        cached = cache.load_config(video_path).get("invert", False)
-        print(f"无法检测终端背景，沿用上次设置: "
-              f"{'反转' if cached else '不反转'}")
-        return cached
-    invert = not is_light
-    print(f"检测到{'浅色' if is_light else '深色'}终端背景，"
-          f"自动{'启用' if invert else '关闭'}反转")
+def term_label(invert):
+    return "深色终端" if invert else "浅色终端"
+
+
+# 终端背景是「环境」属性而非「视频」属性，所以记在全局偏好里。
+# 早先按每个视频的 config.json 回退是错的：一旦某个视频存错，就会
+# 自我强化，换终端也永远回不来。
+def _prefs_path():
+    return CACHE_DIR / "_prefs.json"
+
+
+def load_prefs():
+    try:
+        return json.loads(_prefs_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_prefs(**fields):
+    data = load_prefs()
+    data.update(fields)
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        _prefs_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ask_terminal_bg():
+    """探测不到背景时问一次，并记进全局偏好。返回 invert。"""
+    i = _menu("探测不到终端背景，请选一个（只问这一次，之后可随时改）",
+              [("深色终端", "黑底浅字，亮像素上墨"),
+               ("浅色终端", "白底深字，亮像素留白")])
+    invert = (i != 1)
+    save_prefs(invert=invert, manual=True)
+    print(f"已记住：{term_label(invert)}（改动：cache/_prefs.json）")
     return invert
 
 
-def resolve_size(args, cfg):
-    width = args.width or cfg.get("width") or ask_int(
-        "字符画宽度", convert.DEFAULT_WIDTH)
-    height = args.height or cfg.get("height") or ask_int(
-        "字符画高度", convert.DEFAULT_HEIGHT)
-    return width, height
+def set_terminal_bg(invert, manual=True):
+    """记下终端背景。manual=True 表示用户手动指定，之后不再被自动探测覆盖。"""
+    save_prefs(invert=invert, manual=manual)
+    return invert
 
 
-def resolve_charset(args, video_path, cache, need_interactive=False,
-                    skip_cache=False):
-    """返回 (charset_name, chars_list)。
+def detect_invert(args):
+    """决定 invert，返回 (invert, source)。
 
-    优先级：--chars > --charset > 缓存配置 > (交互询问) > 默认。
-    need_interactive=True 时（首次转换）允许询问用户。
-    skip_cache=True 时忽略缓存里的字符集（用于"重新设置"流程）。
+    source ∈ cli / manual / probe / saved / default。
+
+    **必须在任何 curses 菜单之前调用。** 菜单会切到备用屏并改动 termios，
+    之后再发 OSC 11 查询往往等不到终端应答，探测就会失败。
+    """
+    if args.invert is not None:
+        return args.invert, "cli"
+
+    prefs = load_prefs()
+
+    # 用户手动指定过就以它为准。否则每次自动探测都会把它冲掉 ——
+    # 在 IDE 内置的模拟终端上探测结果可能是错的，那样手动改就永远不生效。
+    if prefs.get("manual") and isinstance(prefs.get("invert"), bool):
+        return prefs["invert"], "manual"
+
+    is_light = detect_light_bg()
+    if is_light is None:
+        # 有些终端首次应答慢，在干净的终端状态上重试一次
+        is_light = detect_light_bg()
+    _stty_sane()
+
+    if is_light is not None:
+        invert = not is_light
+        save_prefs(invert=invert, manual=False)   # 记下来，下次探测失败也能用
+        return invert, "probe"
+
+    saved = prefs.get("invert")
+    if isinstance(saved, bool):
+        return saved, "saved"
+
+    # 一无所知：交给调用方问一次（不要瞎猜然后写死）
+    return None, "default"
+
+
+def _parse_braille_spec(spec):
+    """从 "dither|g<gamma>" 解析出 (dither, gamma)，坏值退回默认。"""
+    dither, gamma = convert.DEFAULT_DITHER, convert.DEFAULT_GAMMA
+    for part in str(spec or "").split("|"):
+        part = part.strip()
+        if part in convert.DITHER_MODES:
+            dither = part
+        elif part.startswith("g"):
+            try:
+                gamma = float(part[1:])
+            except ValueError:
+                pass
+    return dither, gamma
+
+
+def _braille_spec_from_args(args, ask=False, cur=None):
+    """构造 Braille 的 spec 串 "dither|g<gamma>"。
+
+    ask=True 表示用户刚刚在界面上显式选了 braille，此时用 cur（当前正在用的
+    spec）当默认值，并且**不看命令行** —— 否则 `--braille` / `--braille-gamma`
+    会把用户在设置屏里的选择一直压住，braille 参数等于改不动。
+
+    抖动菜单里 Esc/q = **整套 braille 参数保持不动**（连 gamma 也不再追问），
+    对应"返回上一层不改动"的统一语义。
+    """
+    cur_dither, cur_gamma = _parse_braille_spec(cur)
+
+    if ask:
+        modes = list(convert.DITHER_MODES)
+        i = _menu("Braille 抖动方式",
+                  [("bayer", "有序抖动，快，长视频首选"),
+                   ("floyd", "误差扩散，层次最好，转换慢"),
+                   ("none", "硬阈值，高对比度片源最锐利")],
+                  default=modes.index(cur_dither),
+                  cancel="保持当前（不改动）")
+        if i is None:
+            print(f"Braille 参数保持不变（抖动: {cur_dither}, "
+                  f"gamma: {cur_gamma:g}）")
+            return f"{cur_dither}|g{cur_gamma:g}"
+        dither = modes[i]
+
+        v = ask_text("Braille gamma", f"{cur_gamma:g}", ">1 提亮暗部")
+        try:
+            gamma = float(v)
+        except (TypeError, ValueError):
+            print(f"输入无效，保持 {cur_gamma:g}")
+            gamma = cur_gamma
+        if gamma <= 0:
+            print(f"gamma 必须为正数，用默认 {convert.DEFAULT_GAMMA:g}")
+            gamma = convert.DEFAULT_GAMMA
+    else:
+        dither = getattr(args, "braille_dither", None) or cur_dither
+        gamma = getattr(args, "braille_gamma", None)
+        if gamma is None:
+            gamma = cur_gamma
+        if not gamma or gamma <= 0:
+            gamma = convert.DEFAULT_GAMMA
+
+    print(f"使用 Braille 点阵（抖动: {dither}, gamma: {gamma:g}）")
+    return f"{dither}|g{gamma:g}"
+
+
+def pick_charset(cur_name=None, cur_chars=None):
+    """交互式选字符集，返回 (name, chars)。
+
+    cur_* 是当前设置：既决定默认高亮项，也是 Braille 参数的初值 ——
+    否则在设置屏里反复进来，刚设好的抖动/gamma 会被忘掉，要重设一遍。
+    Esc/q 走 cancel 分支，直接返回当前设置（"保持不动"），编号菜单里
+    对应多出来的 [0] 项。注意不能用 esc_value=default：那会把 Esc 当成
+    "选了默认项"，若当前正是 braille/custom 就会又追问一遍参数。
+    """
+    names = list(convert.CHARSETS)
+    opts = []
+    for nm in names:
+        cs = convert.CHARSETS[nm]
+        preview = cs if len(cs) <= 22 else cs[:22] + "…"
+        opts.append((nm, f"{len(cs):2d} 档  {preview}"))
+    opts.append((convert.BRAILLE_CHARSET, "点阵  2×4 点/字符，黑白极限分辨率"))
+    opts.append(("自定义字符表…", "手动粘贴一串字符"))
+
+    if cur_name in names:
+        default = names.index(cur_name)
+    elif cur_name == convert.BRAILLE_CHARSET:
+        default = len(names)
+    elif cur_name == "custom":
+        default = len(names) + 1
+    else:
+        default = names.index(convert.DEFAULT_CHARSET)
+
+    i = _menu("选择字符集", opts, default=default,
+              cancel="保持当前（不改动）")
+    if i is None:                             # Esc/q：保持当前设置
+        if cur_name == convert.BRAILLE_CHARSET and cur_chars:
+            # braille 的 cur_chars 是 spec 串 "dither|g<gamma>"，整串保留，
+            # 不能 list() 拆成单个字符（那正是下面分支对 custom 的做法）
+            return convert.BRAILLE_CHARSET, cur_chars
+        if cur_name == "custom" and cur_chars and len(cur_chars) >= 2:
+            return "custom", list(cur_chars)
+        if cur_name in names:
+            return convert.get_chars(cur_name)
+        return convert.get_chars(convert.DEFAULT_CHARSET)
+
+    if i == len(names):                       # braille
+        spec = cur_chars if cur_name == convert.BRAILLE_CHARSET else None
+        return convert.BRAILLE_CHARSET, _braille_spec_from_args(None, ask=True,
+                                                                cur=spec)
+    if i == len(names) + 1:                   # 自定义
+        # 不 strip：字符表最后一位通常就是空格（最疏档），去掉会丢一档
+        s = input("粘贴字符表（从密到疏，直接回车取消）: ")
+        if len(s) >= 2:
+            print(f"使用自定义字符集 ({len(s)} 档)")
+            return "custom", list(s)
+        print("输入太短，已取消自定义")
+        if cur_name:
+            return cur_name, cur_chars
+        return convert.get_chars(convert.DEFAULT_CHARSET)
+    return convert.get_chars(names[i])
+
+
+def resolve_charset(args, video_path, cache):
+    """按优先级决定用哪个字符集，返回 (charset_name, chars)。
+
+    对 ASCII 字符集，chars 是 list[char]；对 braille，chars 是 spec 串
+    "dither|g<gamma>"（渲染参数同样要进缓存 key，所以要跟着一起传）。
+
+    优先级：--chars > --braille / --charset > 缓存里上次用的 > 默认。
+    需要"问用户"的场合一律走 pick_charset()，这里不做交互。
     """
     if args.chars:
         chars = list(args.chars)
@@ -646,179 +1184,340 @@ def resolve_charset(args, video_path, cache, need_interactive=False,
         print(f"使用自定义字符集 ({len(chars)} 档)")
         return "custom", chars
 
+    if args.braille or args.charset == convert.BRAILLE_CHARSET:
+        return convert.BRAILLE_CHARSET, _braille_spec_from_args(args)
+
     if args.charset:
         try:
             return convert.get_chars(args.charset)
         except ValueError as e:
             sys.exit(str(e))
 
-    if not skip_cache:
-        cfg = cache.load_config(video_path)
-        cached_name = cfg.get("charset")
-        cached_chars = cfg.get("chars")
-        if cached_name and cached_chars and len(cached_chars) >= 2:
-            if cached_name != convert.DEFAULT_CHARSET:
-                print(f"沿用上次字符集: {cached_name} ({len(cached_chars)} 档)")
-            return cached_name, list(cached_chars)
+    cfg = cache.load_config(video_path)
+    cached_name = cfg.get("charset")
+    cached_chars = cfg.get("chars")
+    if cached_name and cached_chars and len(cached_chars) >= 2:
+        if cached_name == convert.BRAILLE_CHARSET:
+            print(f"沿用上次字符集: braille ({cached_chars})")
+            return convert.BRAILLE_CHARSET, cached_chars
+        if cached_name != convert.DEFAULT_CHARSET:
+            print(f"沿用上次字符集: {cached_name} ({len(cached_chars)} 档)")
+        return cached_name, list(cached_chars)
 
-    if not need_interactive:
-        return convert.get_chars(convert.DEFAULT_CHARSET)
-
-    # 首次转换 / 重新设置：让用户选一次
-    print("\n可选字符集:")
-    for name, chars in convert.CHARSETS.items():
-        preview = chars if len(chars) <= 24 else chars[:24] + "..."
-        mark = " (默认)" if name == convert.DEFAULT_CHARSET else ""
-        print(f"  {name:8s} [{len(chars):2d}档]{mark}  {preview}")
-    s = input(f"选择字符集名（回车默认 {convert.DEFAULT_CHARSET}，"
-              f"或直接粘贴自定义字符表）: ").strip()
-
-    if not s:
-        return convert.get_chars(convert.DEFAULT_CHARSET)
-    if s in convert.CHARSETS:
-        return convert.get_chars(s)
-    if len(s) >= 2:
-        print(f"使用自定义字符集 ({len(s)} 档)")
-        return "custom", list(s)
-    print("输入太短，使用默认字符集")
     return convert.get_chars(convert.DEFAULT_CHARSET)
 
-def run_setup_wizard(args, video_path, cache, cfg):
-    """交互式设置向导，返回 settings dict。"""
-    print("\n=== 设置向导 ===")
-    print("  [1] 简单设置 —— 只调分辨率、字符集")
-    print("  [2] 高级设置 —— 额外可调帧率、抽帧、插值、线程")
-    mode = input("选择 (回车默认 1): ").strip().lower()
-    advanced = mode in ("2", "高级", "a", "advanced")
 
-    s = {}
+_VIDEO_SIZE_CACHE = {}
 
-    # 分辨率：命令行 > 向导输入（默认填上次的值）
-    default_w = cfg.get("width", convert.DEFAULT_WIDTH)
-    default_h = cfg.get("height", convert.DEFAULT_HEIGHT)
-    hint_w = "上次设置" if cfg.get("width") else "系统默认"
-    hint_h = "上次设置" if cfg.get("height") else "系统默认"
-    s["width"] = args.width or ask_int("字符画宽度", default_w, hint_w)
-    s["height"] = args.height or ask_int("字符画高度", default_h, hint_h)
 
-    # 字符集：跳过缓存，强制重新问
-    name, chars = resolve_charset(args, video_path, cache,
-                                  need_interactive=True, skip_cache=True)
-    s["charset_name"] = name
-    s["chars"] = chars
+def _video_size(video_path):
+    """原片像素尺寸，带记忆（设置屏可能来回进出好几轮）。失败返回 None。"""
+    key = str(video_path)
+    if key not in _VIDEO_SIZE_CACHE:
+        _VIDEO_SIZE_CACHE[key] = convert.video_size(video_path)
+    return _VIDEO_SIZE_CACHE[key]
 
-    # 帧率
-    if args.fps is not None:
-        s["fps"] = args.fps
-    elif advanced:
-        v = input("播放帧率 (回车使用视频自带): ").strip()
-        s["fps"] = float(v) if v else None
+
+def _auto_size(width, video_path):
+    """按原片比例 + 当前终端大小算默认字符画尺寸，返回 (cols, rows)。
+
+    不这么算的话，4:3 的片源套 90x30、16:9 的套 90x30，都会拉成"宽版普京"：
+    字符格是 1:2 的，行列比必须跟着原片比例走才对得上。
+    """
+    size = _video_size(video_path)
+    if not size:
+        return width, convert.DEFAULT_HEIGHT
+    try:
+        term = shutil.get_terminal_size()
+        term_cols, term_rows = term.columns, term.lines
+    except Exception:
+        term_cols = term_rows = 0
+    return convert.fit_size(width, size[0], size[1], term_cols, term_rows)
+
+
+def run_setup_wizard(args, video_path, cache, cfg, invert=False, back=None):
+    """设置界面：一屏列出全部参数，回车直接开始，选一项即可改。
+
+    只在真正需要转换时进入（没有可用缓存，或用户选了"重新设置"）。
+    返回参数字典；**返回 None 表示用户选了 `← 返回…`**，调用方应该退回去。
+
+    back 非空（例如 "选缓存"）时菜单底部多一行 `← 返回选缓存（不改动）`，
+    Esc/q 也落在这一行——设置屏是从缓存菜单进来的，就得能退回去。
+    back 为空（首次运行没缓存、`--setup`）时没有上一屏，Esc 仍是「开始转换」。
+
+    每一项的初值都按同一套优先级取：**命令行 > 上次用的（config.json）> 默认**。
+    早先抽帧/插值/线程只读命令行，于是从缓存菜单选"重新设置"进来时，这几项
+    显示的是命令行默认值而不是上次用的值，和分辨率/字符集的体验不一致。
+
+    帧率是唯一的例外：config.json 里的 `fps` 存的是**实际生效的帧率**（可能
+    已经被抽帧除过），不能反推用户当时选的是"视频自带"还是某个数字，所以另存
+    一个 `fps_override` 字段来记住意图（旧配置没有这个字段，退化为"视频自带"）。
+
+    分辨率同理：高度是"按原片比例算出来的"还是"用户手填的"要分开记
+    （`height_auto`），否则要么用户手填的尺寸被自动换算冲掉，要么老配置里
+    那个不对比例的 90x30 永远修不回来。
+    """
+    width = args.width or cfg.get("width") or convert.DEFAULT_WIDTH
+    height_auto = False
+    if args.height:
+        height = args.height
+    elif cfg.get("height") and not cfg.get("height_auto", True):
+        height = int(cfg["height"])          # 上次手填过，尊重它
     else:
-        s["fps"] = None
+        # 高度没被明确指定（或上次就是算出来的）→ 按原片比例算
+        width, height = _auto_size(width, video_path)
+        height_auto = True
+    name, chars = resolve_charset(args, video_path, cache)
+    fps = args.fps if args.fps is not None else cfg.get("fps_override")
+    frame_step = args.frame_step if args.frame_step is not None \
+        else cfg.get("frame_step") or 1
+    interp = args.interp if args.interp is not None \
+        else cfg.get("interp") or convert.DEFAULT_INTERP
+    threads = args.threads if args.threads is not None else cfg.get("threads")
+    # config.json 是用户可见、可手改的，读进来先做一次类型兜底
+    if fps is not None:
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = None
+    try:
+        frame_step = max(1, int(frame_step))
+    except (TypeError, ValueError):
+        frame_step = 1
+    if interp not in convert.INTERP_MAP:
+        interp = convert.DEFAULT_INTERP
+    if threads is not None:
+        try:
+            threads = int(threads)
+        except (TypeError, ValueError):
+            threads = None
 
-    # 高级选项：默认沿用命令行/配置
-    s["frame_step"] = args.frame_step
-    s["interp"] = args.interp
-    s["threads"] = args.threads
+    def charset_desc():
+        if name == convert.BRAILLE_CHARSET:
+            return f"braille  {chars}"
+        return f"{name}  ({len(chars)} 档)" if name != "custom" \
+            else f"custom  ({len(chars)} 档)"
 
-    if advanced:
-        v = input(f"抽帧步长 (1=每帧都转，2=隔一帧，"
-                  f"回车默认 {args.frame_step}): ").strip()
-        if v.isdigit() and int(v) >= 1:
-            s["frame_step"] = int(v)
+    def fps_desc():
+        return "视频自带" if fps is None else f"{fps:g} fps"
 
-        v = input(f"插值方式 {list(convert.INTERP_MAP)} "
-                  f"(回车默认 {args.interp}): ").strip()
-        if v in convert.INTERP_MAP:
-            s["interp"] = v
+    def bg_desc():
+        prefs = load_prefs()
+        tag = "手动" if prefs.get("manual") else "自动"
+        return f"{term_label(invert)}（{tag}）"
 
-        v = input(f"OpenCV 线程数 (回车默认 "
-                  f"{args.threads if args.threads is not None else '自动'}): "
-                  ).strip()
-        if v.isdigit():
-            s["threads"] = int(v)
+    while True:
+        fields = [
+            ("分辨率", f"{width} x {height}"),
+            ("字符集", charset_desc()),
+            ("终端背景", bg_desc()),
+            ("帧率", fps_desc()),
+            ("抽帧步长", str(frame_step)),
+            ("插值方式", interp),
+            ("OpenCV 线程", "自动" if threads is None else str(threads)),
+        ]
+        label_w = max(_dwidth(k) for k, _ in fields)
+        opts = [(_dpad(k, label_w + 4) + v, "") for k, v in fields]
+        start_at = len(opts)
+        # 不带 ▸：高亮项自带 " ▸ " 前缀，写进标签会渲染成 " ▸ ▸ 开始转换"
+        opts.append(("开始转换", ""))
+        back_at = None
+        if back:
+            # 有上一屏（缓存菜单）可退时多加一行，Esc 让给它
+            back_at = len(opts)
+            opts.append((f"← 返回{back}（不改动）", ""))
+        # esc_value 让 Esc/q 有个明确落点：能退就退，不能退就是「开始转换」。
+        # 用 esc_value 而不是 cancel，是为了不在编号菜单里多出一行重复的 [0]。
+        esc_at = back_at if back_at is not None else start_at
+        footer = ("↑↓ 选择   Enter 修改/开始   Esc "
+                  + (f"返回{back}" if back_at is not None else "直接开始"))
+        i = _menu(f"设置  ·  {term_label(invert)}", opts,
+                  default=start_at, esc_value=esc_at, footer=footer)
 
-    return s
+        if i is None or i == start_at:
+            break
+        if back_at is not None and i == back_at:
+            return None                       # 返回上一屏（缓存菜单）
+
+        if i == 0:
+            v = ask_text("分辨率 (宽x高)", "", f"当前 {width}x{height}，回车不变")
+            a, _, b = v.lower().partition("x")
+            if a.strip().isdigit() and b.strip().isdigit():
+                width, height = int(a), int(b)
+                height_auto = False      # 用户手填了，之后不再自动按比例算
+            elif v:
+                print(f"输入无效，保持 {width}x{height}")
+        elif i == 1:
+            # 直接用 pick_charset：不走 resolve_charset 的命令行优先链，
+            # 否则 --braille / -c 会把用户在这里的选择一直压住。
+            name, chars = pick_charset(name, chars)
+        elif i == 2:
+            # 手动选择优先级高于自动探测，之后不会再被覆盖
+            prefs = load_prefs()
+            auto = not prefs.get("manual")
+            j = _menu("终端背景",
+                      [("自动探测", f"目前为{term_label(invert)}"),
+                       ("深色终端", "黑底浅字，亮像素上墨"),
+                       ("浅色终端", "白底深字，亮像素留白")],
+                      default=0 if auto else (1 if invert else 2),
+                      cancel="返回（不改动）")
+            if j is None:
+                continue
+            if j == 0:
+                invert, _ = detect_invert(args)
+                if invert is None:
+                    invert = prefs.get("invert", False)
+                set_terminal_bg(invert, manual=False)
+                print(f"终端背景改为自动探测：{term_label(invert)}")
+            else:
+                invert = set_terminal_bg(j == 1, manual=True)
+                print(f"终端背景已固定为：{term_label(invert)}（手动）")
+        elif i == 3:
+            v = ask_text("帧率", "", "回车=视频自带")
+            if v:
+                try:
+                    fps = float(v)
+                except ValueError:
+                    print(f"输入无效，保持 {fps_desc()}")
+            else:
+                fps = None
+        elif i == 4:
+            frame_step = max(1, ask_number("抽帧步长", frame_step,
+                                           "1=每帧都转，回车不变"))
+        elif i == 5:
+            modes = list(convert.INTERP_MAP)
+            j = _menu("插值方式", [(m, "") for m in modes],
+                      default=modes.index(interp) if interp in modes else 0,
+                      cancel="返回（不改动）")
+            if j is not None:
+                interp = modes[j]
+        elif i == 6:
+            v = ask_text("OpenCV 线程数", "", "回车=自动")
+            if v.isdigit():
+                threads = int(v)
+            elif v == "":
+                threads = None
+            else:
+                print(f"输入无效，保持 {threads if threads else '自动'}")
+
+    return {
+        "width": width, "height": height, "height_auto": height_auto,
+        "charset_name": name, "chars": chars,
+        "invert": invert,
+        "fps": fps, "frame_step": frame_step,
+        "interp": interp, "threads": threads,
+    }
 
 def _read_cache_meta(path):
-    """从缓存文件读取字符集预览和帧率。失败返回 ('', None)。"""
+    """从缓存文件读取 (字符集预览, 帧率, 完整字符表)。失败返回 ('', None, '')。
+
+    完整字符表用来和 config.json 里的 chars 精确比对，判断哪条是"上次使用"：
+    只比较 12 字符的预览会误判 —— 两个自定义字符表或两套 braille 参数，
+    前 12 个字符相同就撞上了。
+    """
     try:
         with open(path, "rb") as f:
             payload = pickle.load(f)
     except Exception:
-        return "", None
+        return "", None, ""
 
     s = payload.get("settings", {})
     chars = s.get("chars", "")
-    if len(chars) <= 12:
-        preview = chars
-    else:
-        preview = chars[:12] + "..."
-    return preview, payload.get("video_fps")
+    preview = chars if len(chars) <= 12 else chars[:12] + "..."
+    return preview, payload.get("video_fps"), chars
 
-def ask_choose_cache(caches, cfg, invert):
-    matching = [(k, i, p) for k, i, p in caches if i["invert"] == invert]
-
-    if not matching:
-        other = [c for c in caches if c[1]["invert"] != invert]
-        if other:
-            want = "深色" if invert else "浅色"
-            have = "浅色" if invert else "深色"
-            print(f"\n当前是{want}终端，但该视频只有 {len(other)} 个"
-                  f"{have}终端的缓存，无法直接沿用。")
-            print(f"如需使用，请在{have}终端里运行，或输入 0 重新设置。")
-        return None
-
+def _cache_menu_opts(matching, cfg):
+    """构造缓存菜单项，返回 (opts, 默认下标)。"""
     last_w = cfg.get("width")
     last_h = cfg.get("height")
     last_chars = cfg.get("chars", "")
-    default_idx = 1
+    opts, default_idx = [], 0
 
-    print(f"\n发现该视频的 {len(matching)} 个可用缓存:")
-
-    for i, (key, info, path) in enumerate(matching, 1):
-        preview, fps = _read_cache_meta(path)
-        is_last = (info["width"] == last_w
-                   and info["height"] == last_h
-                   and preview.startswith(last_chars[:12]) if last_chars else False)
-        mark = "  ← 上次使用" if is_last else ""
+    for info, path in ((i, p) for _, i, p in matching):
+        preview, fps, chars = _read_cache_meta(path)
+        label = (f"{info['width']}x{info['height']}  "
+                 f"{_charset_label(info, preview)}")
+        is_last = (bool(last_chars)
+                   and info["width"] == last_w and info["height"] == last_h
+                   and chars == last_chars)
         if is_last:
-            default_idx = i
+            default_idx = len(opts)
+        # 「上次使用」放进说明列，标签才能对齐成规整一列
+        bits = [f"{fps:.0f} fps"] if fps else []
+        if is_last:
+            bits.append("← 上次使用")
+        opts.append((label, "   ".join(bits)))
+    return opts, default_idx
 
-        # 字符集显示：custom 带预览
-        if info["charset"] == "custom" and preview:
-            charset_label = f"custom [{preview}]"
-        elif info["charset"] == "custom":
-            charset_label = "custom"
-        else:
-            charset_label = info["charset"]
 
-        fps_str = f" {fps:.0f}fps" if fps else ""
-        print(f"  [{i}] {info['width']}x{info['height']} | "
-              f"{charset_label}{fps_str}{mark}")
+def ask_choose_cache(caches, cfg, invert, source="probe", cache=None,
+                     video_path=None):
+    """从缓存里挑一个，返回 (chosen, invert)；chosen 为 None 表示重新设置。
 
-    print(f"  [0] 重新设置")
-    print("  (Ctrl+C 可随时中止)")
+    菜单里**始终**带一个「切换终端背景」项：探测不准或探测不到时，用户在这里
+    一键换到另一种背景，选择会存进全局偏好。当前背景一条缓存都没有时也照样
+    显示——否则只有浅色缓存的视频会变成死路，用户被迫走一遍设置屏才能换背景。
+
+    当前背景一条缓存都没有、而另一种背景有时，再给一行
+    「⇄ 取反生成另一版」：把对面那些缓存逐字符取反存成当前明暗的缓存（无损，
+    几秒，不重新解码视频）。传了 cache/video_path 才提供这一项。
+    """
+    if not caches:
+        return None, invert
+
+    can_generate = cache is not None and video_path is not None
 
     while True:
-        s = input(f"选择 (0-{len(matching)}, 回车默认 {default_idx}): ").strip()
-        if not s:
-            chosen = matching[default_idx - 1]
-            return chosen[0], chosen[2]
-        if s == "0":
-            return None
-        if s.isdigit() and 1 <= int(s) <= len(matching):
-            chosen = matching[int(s) - 1]
-            return chosen[0], chosen[2]
-        print("输入无效，请重试。")
+        matching = [(k, i, p) for k, i, p in caches if i["invert"] == invert]
+        other = "浅色" if invert else "深色"
+        mine = "深色" if invert else "浅色"
+        opposite = [(k, i, p) for k, i, p in caches if i["invert"] != invert]
 
-def ask_reuse_config(cfg):
-    """检测到已有配置时询问是否沿用。返回 True=沿用，False=重新设置。"""
-    print(f"\n检测到上次配置：{cfg['width']}x{cfg['height']} | "
-          f"字符集 {cfg.get('charset', 'classic')} | "
-          f"{cfg.get('fps', '?')} fps")
-    ans = input("沿用上次设置？(回车=沿用，n=重新设置): ").strip().lower()
-    return ans not in ("n", "no", "否")
+        opts, default_idx = _cache_menu_opts(matching, cfg)
+        generate_at = None
+        if not matching and opposite and can_generate:
+            generate_at = len(opts)
+            opts.append((f"⇄ 用{other}缓存取反生成{mine}版",
+                         f"把 {len(opposite)} 个{other}缓存翻过来，秒级，"
+                         f"不重新解码视频"))
+            default_idx = generate_at      # 没有可选项时，高亮"能用的那个动作"
+
+        flip_at = len(opts)
+        if matching:
+            detail = f"另一种背景有 {len(opposite)} 个缓存" if opposite \
+                else "按另一种背景重新筛选缓存"
+        else:
+            detail = (f"切换到{other}终端后可用 {len(opposite)} 个缓存"
+                      if opposite else "另一种背景也没有缓存")
+            if generate_at is None:
+                default_idx = flip_at
+        opts.append((f"⇄ 切换为{other}终端", detail))
+
+        title = f"选择缓存  ·  {term_label(invert)}"
+        if source in ("saved", "default", "probe"):
+            title += "（自动判断，可切换）" if source == "probe" \
+                else "（探测不到，可切换）"
+        elif source == "manual":
+            title += "（手动指定）"
+        if not matching:
+            title += f"  ·  无{term_label(invert)}缓存"
+
+        i = _menu(title, opts, default=default_idx, cancel="重新设置")
+        if i is None:
+            return None, invert
+        if generate_at is not None and i == generate_at:
+            done = sum(1 for _, _, p in opposite
+                       if cache.generate_inverted(p, video_path))
+            if not done:
+                can_generate = False       # 一个都没成，别再来一遍
+            caches = cache.list_caches(video_path)   # 重新扫描，新缓存才会出现
+            continue
+        if i == flip_at:
+            # 手动切换后不再被自动探测覆盖
+            invert = set_terminal_bg(not invert, manual=True)
+            source = "manual"
+            continue
+        return (matching[i][0], matching[i][2]), invert
 
 # ============ 主流程 ============
 
@@ -832,68 +1531,113 @@ def main():
         for name, chars in convert.CHARSETS.items():
             preview = chars if len(chars) <= 40 else chars[:40] + "..."
             print(f"  {name:8s} [{len(chars):2d}档]  {preview}")
+        print(f"  {convert.BRAILLE_CHARSET:8s} [点阵]   "
+              f"Braille 点阵 + 抖动，2×4 点/字符，")
+        print(f"  {'':8s}         需要终端字体支持 U+2800–U+28FF")
         return
+
+    # 终端背景必须在这里探测：下面的 resolve_media 会开 curses 菜单，
+    # 用过 curses 之后 OSC 11 查询就不可靠了（详见 detect_invert）。
+    invert, invert_src = detect_invert(args)
+    if invert is None:
+        # 探测不到又没存过：问一次并记进全局偏好，不瞎猜
+        invert = ask_terminal_bg()
+        invert_src = "asked"
 
     cache = Cache(CACHE_DIR, DATA_DIR)
     video_path, bgm_path = resolve_media(args)
     cfg = cache.load_config(video_path)
-    invert = resolve_invert(args, video_path, cache)
     audio_name = bgm_path.name if bgm_path else ""
 
-    # ---- 让用户从已有缓存里选一个 ----
+    # ---- 缓存菜单 ⇄ 设置屏：两边都能退回对方 ----
     all_caches = cache.list_caches(video_path)
-    chosen = None
-    if all_caches and not args.rebuild and not args.setup:
-        chosen = ask_choose_cache(all_caches, cfg, invert)
+    # --rebuild / --setup / 一条缓存都没有时不显示缓存菜单，设置屏也就没有上一屏
+    menu_available = bool(all_caches) and not args.rebuild and not args.setup
+    while True:
+        chosen = None
+        if menu_available:
+            chosen, invert = ask_choose_cache(all_caches, cfg, invert, invert_src,
+                                              cache=cache, video_path=video_path)
 
-    if chosen is not None:
-        key, data_path = chosen
-        result = cache.load_by_path(data_path, args.fps)
-        if result:
-            video_data, fps, settings = result
-            print(f"读取缓存: {data_path.name}")
-            cache.save_config(
-                video_path,
-                width=settings.get("width"),
-                height=settings.get("height"),
-                fps=fps,
-                invert=settings.get("invert", invert),
-                audio=audio_name,
-                charset=settings.get("charset", "classic"),
-                chars=settings.get("chars", ""),
-                frame_step=settings.get("frame_step", 1),
-                interp=settings.get("interp", convert.DEFAULT_INTERP),
-            )
-            play(video_data, fps, bgm_path, args.delay)
-            return
-        print("缓存损坏，进入设置向导...")
+        if chosen is not None:
+            key, data_path = chosen
+            result = cache.load_by_path(data_path, args.fps)
+            if result:
+                video_data, fps, settings = result
+                # fps_override 是"用户想用多少帧率"的意图，缓存里没有这个信息，
+                # 只能沿用 config 里的旧值，别在这一步把它丢掉
+                cache.save_config(
+                    video_path,
+                    width=settings.get("width"),
+                    height=settings.get("height"),
+                    height_auto=cfg.get("height_auto", True),
+                    fps=fps,
+                    fps_override=cfg.get("fps_override"),
+                    invert=settings.get("invert", invert),
+                    audio=audio_name,
+                    charset=settings.get("charset", "classic"),
+                    chars=settings.get("chars", ""),
+                    frame_step=settings.get("frame_step", 1),
+                    interp=settings.get("interp", convert.DEFAULT_INTERP),
+                    threads=cfg.get("threads"),
+                )
+                play(video_data, fps, bgm_path, args.delay)
+                return
+            print("缓存损坏，重新转换")
 
-    # ---- 重新设置 ----
-    s = run_setup_wizard(args, video_path, cache, cfg)
+        s = run_setup_wizard(args, video_path, cache, cfg, invert,
+                             back="选缓存" if menu_available else None)
+        if s is not None:
+            break
+        # 设置屏里选了「← 返回选缓存」：回到缓存菜单重新挑
+    invert = s["invert"]           # 设置屏里可能刚切换过终端背景
+    cache_path = cache.data_path(video_path, s["width"], s["height"],
+                                 invert, s["charset_name"], s["chars"])
 
-    # 新设置恰好命中某个已有缓存 → 直接复用，不重新转换
+    # 新设置命中已有缓存 → 直接复用；
+    # 只有反明暗的同名缓存 → 取反复用（不重新解码视频，见 Cache.load_opposite）；
+    # 两个都没有 → 老老实实从视频转换
+    # （抽帧/插值不在缓存 key 里，上面两个查询都会额外核对 payload）
     result = cache.load_data(video_path, s["width"], s["height"], invert,
-                             s["charset_name"], s["chars"], s["fps"])
+                             s["charset_name"], s["chars"], s["fps"],
+                             frame_step=s["frame_step"], interp=s["interp"])
+    flipped = False
+    if result is None and not args.rebuild:
+        result = cache.load_opposite(video_path, s["width"], s["height"], invert,
+                                     s["charset_name"], s["chars"], s["fps"],
+                                     frame_step=s["frame_step"],
+                                     interp=s["interp"])
+        flipped = result is not None
+
     if result is not None and not args.rebuild:
         video_data, fps = result
-        print(f"新设置与已有缓存匹配，直接复用")
+        if flipped:
+            # 取反结果存到当前明暗的 key 下，下次就直接命中，不用再翻一遍
+            convert.save_frames(cache_path, video_data, {
+                "source": str(video_path),
+                "width": s["width"], "height": s["height"], "invert": invert,
+                "charset": s["charset_name"], "chars": "".join(s["chars"]),
+                "frame_step": s["frame_step"], "interp": s["interp"],
+            }, fps)
+            wait_any_key("\n按任意键开始播放…")
     else:
-        cache_path = cache.data_path(video_path, s["width"], s["height"],
-                                     invert, s["charset_name"], s["chars"])
         video_data, video_fps = convert.video_to_ascii(
             video_path, s["chars"], s["charset_name"],
             s["width"], s["height"], invert, cache_path,
             frame_step=s["frame_step"], interp=s["interp"],
             threads=s["threads"])
         fps = s["fps"] or video_fps
-        wait_any_key("\n转换完成，按任意键继续...")
+        wait_any_key("\n按任意键开始播放…")
 
     cache.save_config(
         video_path,
-        width=s["width"], height=s["height"], fps=fps,
+        width=s["width"], height=s["height"], height_auto=s["height_auto"],
+        fps=fps,
+        fps_override=s["fps"],
         invert=invert, audio=audio_name,
         charset=s["charset_name"], chars="".join(s["chars"]),
         frame_step=s["frame_step"], interp=s["interp"],
+        threads=s["threads"],
     )
     play(video_data, fps, bgm_path, args.delay)
 

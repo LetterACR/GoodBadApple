@@ -1,0 +1,18 @@
+# 在 Python 3.11.3 (macOS) 上验证通过的版本，见每行上方注释。
+# 安装：pip install -r requirements.txt
+
+# 实际安装的版本：2.4.6
+numpy>=2.0
+
+# 实际安装的版本：5.0.0.93
+# 只用 VideoCapture 解码，不需要 GUI 窗口，所以 headless 版足够且体积更小。
+# 若你还需要 cv2.imshow 之类的功能，换成 opencv-python 即可。
+opencv-python-headless>=4.8
+
+# 实际安装的版本：2.6.1
+# 只用于播放 mp3/wav/ogg，不打开窗口。
+pygame>=2.5
+
+# Windows 的 Python 标准库不带 curses，方向键菜单和播放都依赖它，
+# 所以 Windows 上必须装这个第三方实现（Linux/macOS 会自动跳过）。
+windows-curses>=2.3 ; sys_platform == "win32"

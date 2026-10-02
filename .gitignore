@@ -1,0 +1,10 @@
+# 转换缓存与本地素材：体积大且可再生成，不进版本库
+cache/
+data/
+
+# Python 运行产物
+__pycache__/
+*.py[cod]
+
+# 系统文件
+.DS_Store
